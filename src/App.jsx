@@ -37,7 +37,7 @@ import {
 
 const SUPA_URL  = import.meta.env.VITE_SUPABASE_URL  ?? "";
 const SUPA_KEY  = import.meta.env.VITE_SUPABASE_ANON_KEY ?? "";
-const TABLE     = "sales_records";
+const TABLE     = "sales_data";
 
 // createClient 只在 URL + KEY 都存在時初始化，否則回傳 null
 const supabase = SUPA_URL && SUPA_KEY ? createClient(SUPA_URL, SUPA_KEY) : null;

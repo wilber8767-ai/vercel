@@ -1,17 +1,24 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
- * ║  郭華益 團隊業績管理系統  ─  React + Tailwind CSS            ║
+ * ║  郭華益 團隊業績管理系統  ─  React + Tailwind CSS + Supabase ║
  * ║  明亮高對比版  ·  115 年度官方校對工作月日期                  ║
  * ╚══════════════════════════════════════════════════════════════╝
  *
- * ── 雲端對接預留區 ────────────────────────────────────────────
- *   const API_ENDPOINT = "https://your-api.example.com/v1";
- *   async function cloudGet(key) { ... }
- *   async function cloudSet(key, data) { ... }
- * ──────────────────────────────────────────────────────────────
+ * 環境變數（在 .env 設定，不要直接寫在程式碼裡）：
+ *   VITE_SUPABASE_URL=https://your-project.supabase.co
+ *   VITE_SUPABASE_ANON_KEY=your-anon-key
+ *
+ * Supabase 資料表：sales_records
+ *   欄位：agent_name (text PK), work_month (int2 PK),
+ *          life_fyc (numeric), p_c_premium (numeric),
+ *          is_active (bool), recruits (jsonb)
+ *
+ * Row Level Security 建議：
+ *   啟用 RLS，並設定 policy 讓 anon 只能讀寫自己的資料列。
  */
 
 import { useState, useMemo, useCallback, useRef, useEffect } from "react";
+import { createClient } from "@supabase/supabase-js";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Cell, ReferenceLine, ComposedChart,
@@ -20,7 +27,105 @@ import {
   Menu, X, Download, Target, TrendingUp, Award,
   LayoutDashboard, ChevronDown, ChevronUp,
   CheckCircle2, AlertCircle, Plus, Zap, Medal, Clock,
+  CloudOff, Cloud, Loader2,
 } from "lucide-react";
+
+// ═══════════════════════════════════════════════════════════════
+// §0  SUPABASE CLIENT
+//     金鑰從 import.meta.env 讀取，確保不寫死在程式碼裡
+// ═══════════════════════════════════════════════════════════════
+
+const SUPA_URL  = import.meta.env.VITE_SUPABASE_URL  ?? "";
+const SUPA_KEY  = import.meta.env.VITE_SUPABASE_ANON_KEY ?? "";
+const TABLE     = "sales_records";
+
+// createClient 只在 URL + KEY 都存在時初始化，否則回傳 null
+const supabase = SUPA_URL && SUPA_KEY ? createClient(SUPA_URL, SUPA_KEY) : null;
+
+/**
+ * 從 Supabase 讀取所有業績記錄，轉換成 allPerf 格式
+ * { [agent_name]: [[life_fyc, p_c_premium], ...] × 12 }
+ */
+async function fetchAllPerf() {
+  if (!supabase) return null;
+  const { data, error } = await supabase
+    .from(TABLE)
+    .select("agent_name, work_month, life_fyc, p_c_premium, is_active, recruits");
+  if (error) { console.error("[supabase] fetch error:", error.message); return null; }
+
+  const result = {};
+  for (const row of data) {
+    const id = row.agent_name;
+    if (!result[id]) result[id] = Array(12).fill(null).map(()=>[0,0]);
+    const mi = row.work_month - 1; // DB stores 1-12, array is 0-11
+    if (mi >= 0 && mi < 12) {
+      result[id][mi] = [Number(row.life_fyc)||0, Number(row.p_c_premium)||0];
+    }
+  }
+  return result;
+}
+
+/**
+ * 從 Supabase 讀取 meta（recruits, is_active 等），轉換成 allMeta 格式
+ */
+async function fetchAllMeta() {
+  if (!supabase) return null;
+  const { data, error } = await supabase
+    .from(TABLE)
+    .select("agent_name, work_month, is_active, recruits");
+  if (error) { console.error("[supabase] meta fetch error:", error.message); return null; }
+
+  const result = {};
+  for (const row of data) {
+    if (!result[row.agent_name]) result[row.agent_name] = {};
+    // 合併 recruits（只取最新一筆有值的記錄，work_month=1 作為 meta 行）
+    if (row.work_month === 1 && row.recruits) {
+      try { result[row.agent_name].recruits = JSON.parse(row.recruits); }
+      catch { result[row.agent_name].recruits = row.recruits ?? []; }
+    }
+  }
+  return result;
+}
+
+/**
+ * 將單一業績格更新至 Supabase（upsert）
+ * PK: (agent_name, work_month)
+ */
+async function upsertPerfRow(agentName, workMonth, lifeFyc, pcPremium) {
+  if (!supabase) return;
+  const { error } = await supabase.from(TABLE).upsert({
+    agent_name:  agentName,
+    work_month:  workMonth,    // 1-indexed
+    life_fyc:    lifeFyc,
+    p_c_premium: pcPremium,
+  }, { onConflict: "agent_name,work_month" });
+  if (error) console.error("[supabase] upsert error:", error.message);
+}
+
+/**
+ * 將 meta（recruits / is_active）更新至 Supabase
+ * 寫入 work_month=1 那一行的 recruits 欄位
+ */
+async function upsertMetaRow(agentName, meta) {
+  if (!supabase) return;
+  const { error } = await supabase.from(TABLE).upsert({
+    agent_name: agentName,
+    work_month: 1,
+    recruits:   JSON.stringify(meta.recruits ?? []),
+    is_active:  meta.isActive ?? true,
+  }, { onConflict: "agent_name,work_month" });
+  if (error) console.error("[supabase] meta upsert error:", error.message);
+}
+
+// Debounce helper — prevents flooding Supabase with every keystroke
+function useDebounce(fn, delay=800) {
+  const timer = useRef(null);
+  return useCallback((...args) => {
+    clearTimeout(timer.current);
+    timer.current = setTimeout(()=>fn(...args), delay);
+  }, [fn, delay]);
+}
+
 
 // ═══════════════════════════════════════════════════════════════
 // §1  CONSTANTS
@@ -948,32 +1053,79 @@ const NAV = [
 ];
 
 export default function App() {
+  // ── Local state (initialised from localStorage as fallback) ──
   const [members,    setMembers]    = useState(()=>lsGet(LS.MEMBERS, DEFAULT_MEMBERS));
   const [allPerf,    setAllPerf]    = useState(()=>lsGet(LS.PERF, {}));
   const [allMeta,    setAllMeta]    = useState(()=>lsGet(LS.META, {}));
-  const [selectedId, setSelectedId] = useState(members[0]?.id??"");
+  const [selectedId, setSelectedId] = useState(()=>lsGet(LS.MEMBERS, DEFAULT_MEMBERS)[0]?.id??"");
   const [tab,        setTab]        = useState("perf");
-  const [sideOpen,   setSideOpen]   = useState(true);  // desktop
-  const [drawerOpen, setDrawerOpen] = useState(false); // mobile/tablet
+  const [sideOpen,   setSideOpen]   = useState(true);
+  const [drawerOpen, setDrawerOpen] = useState(false);
 
-  const member = members.find(m=>m.id===selectedId)??members[0];
-  const perf   = allPerf[selectedId]??emptyPerf();
-  const meta   = allMeta[selectedId]??{};
-  const curWM  = getCurrentWM();
+  // ── Cloud sync state ──────────────────────────────────────────
+  const [cloudStatus, setCloudStatus] = useState(supabase?"loading":"offline");
+  const [syncing, setSyncing] = useState(false);
 
+  // ── Boot: fetch from Supabase, merge over localStorage ───────
+  useEffect(()=>{
+    if(!supabase) return;
+    (async()=>{
+      try{
+        const [cp,cm] = await Promise.all([fetchAllPerf(), fetchAllMeta()]);
+        if(cp){ setAllPerf(cp); lsSet(LS.PERF,cp); }
+        if(cm){
+          setAllMeta(prev=>{
+            const merged={...prev};
+            Object.entries(cm).forEach(([id,m])=>{ merged[id]={...prev[id],...m}; });
+            lsSet(LS.META,merged);
+            return merged;
+          });
+        }
+        setCloudStatus("ok");
+      }catch(e){ console.error("[supabase] boot:",e); setCloudStatus("error"); }
+    })();
+  },[]);
+
+  // ── Debounced upsert helpers ──────────────────────────────────
+  const debouncedUpsertPerf = useDebounce(async(agentName,workMonth,life,pc)=>{
+    setSyncing(true);
+    await upsertPerfRow(agentName,workMonth,life,pc);
+    setSyncing(false);
+  },800);
+
+  const debouncedUpsertMeta = useDebounce(async(agentName,meta)=>{
+    setSyncing(true);
+    await upsertMetaRow(agentName,meta);
+    setSyncing(false);
+  },800);
+
+  // ── updatePerf: localStorage + Supabase upsert ───────────────
   const updatePerf = useCallback((mi,col,val)=>{
     setAllPerf(prev=>{
       const next={...prev};
       const row=(next[selectedId]??emptyPerf()).map(r=>[...r]);
       row[mi][col]=val; next[selectedId]=row;
-      lsSet(LS.PERF,next); return next;
+      lsSet(LS.PERF,next);
+      const name=members.find(m=>m.id===selectedId)?.name??selectedId;
+      debouncedUpsertPerf(name,mi+1,row[mi][0],row[mi][1]);
+      return next;
     });
-  },[selectedId]);
+  },[selectedId,members,debouncedUpsertPerf]);
 
+  // ── updateMeta: localStorage + Supabase upsert ───────────────
   const updateMeta = useCallback(nm=>{
-    setAllMeta(prev=>{ const next={...prev,[selectedId]:nm}; lsSet(LS.META,next); return next; });
-  },[selectedId]);
+    setAllMeta(prev=>{
+      const next={...prev,[selectedId]:nm}; lsSet(LS.META,next);
+      const name=members.find(m=>m.id===selectedId)?.name??selectedId;
+      debouncedUpsertMeta(name,nm);
+      return next;
+    });
+  },[selectedId,members,debouncedUpsertMeta]);
 
+  const member = members.find(m=>m.id===selectedId)??members[0];
+  const perf   = allPerf[selectedId]??emptyPerf();
+  const meta   = allMeta[selectedId]??{};
+  const curWM  = getCurrentWM();
   const globalL  = members.reduce((s,m)=>s+sumArr((allPerf[m.id]??emptyPerf()).map(r=>safe(r[0]))),0);
   const globalNL = members.reduce((s,m)=>s+sumArr((allPerf[m.id]??emptyPerf()).map(r=>safe(r[1]))),0);
 
@@ -986,13 +1138,41 @@ export default function App() {
     return null;
   },[tab,selectedId,perf,meta,allPerf]);
 
-  // Close mobile drawer when member/tab changes
   useEffect(()=>setDrawerOpen(false),[selectedId,tab]);
 
-  // ── Sidebar content (shared between desktop sidebar and mobile drawer) ──
-  const SideContent = () => (
+  // ── Cloud status badge ────────────────────────────────────────
+  const CloudBadge = ()=>{
+    const cfgs={
+      loading:{ icon:<Loader2 size={15} className="animate-spin"/>, text:"連線中",  cls:"text-blue-600 bg-blue-50 border-blue-200" },
+      ok:     { icon:<Cloud    size={15}/>,                          text:"已同步",  cls:"text-green-700 bg-green-50 border-green-200" },
+      error:  { icon:<CloudOff size={15}/>,                          text:"離線",    cls:"text-red-600 bg-red-50 border-red-200" },
+      offline:{ icon:<CloudOff size={15}/>,                          text:"本機模式",cls:"text-gray-500 bg-gray-50 border-gray-200" },
+    };
+    const cfg=cfgs[cloudStatus]??cfgs.offline;
+    return (
+      <div className={`hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-sm font-semibold ${cfg.cls}`}>
+        {syncing?<Loader2 size={15} className="animate-spin"/>:cfg.icon}
+        {syncing?"同步中…":cfg.text}
+      </div>
+    );
+  };
+
+  // ── Loading screen ────────────────────────────────────────────
+  if(cloudStatus==="loading"){
+    return (
+      <div className="min-h-screen bg-gray-100 flex items-center justify-center">
+        <div className="bg-white rounded-2xl border-2 border-gray-200 shadow-lg px-10 py-10 text-center">
+          <Loader2 size={40} className="text-blue-600 animate-spin mx-auto mb-4"/>
+          <p className="text-xl font-bold text-slate-900 mb-1">正在從雲端載入資料</p>
+          <p className="text-base text-gray-500">連接 Supabase 中，請稍候…</p>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Sidebar content ───────────────────────────────────────────
+  const SideContent = ()=>(
     <div className="flex flex-col h-full">
-      {/* Members */}
       <div className="p-4 border-b-2 border-gray-200">
         <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">成員選擇</p>
         <div className="space-y-1">
@@ -1012,18 +1192,12 @@ export default function App() {
                   <p className="text-lg font-bold text-slate-900 truncate">{m.name}</p>
                   <p className="text-sm font-medium" style={{color:ROLE_COLOR[m.role]}}>{ROLES[m.role]?.label}</p>
                 </div>
-                {mt>0 && (
-                  <span className="text-sm font-bold tabular-nums shrink-0" style={{color:ROLE_COLOR[m.role]}}>
-                    {fmt(mt)}
-                  </span>
-                )}
+                {mt>0&&<span className="text-sm font-bold tabular-nums shrink-0" style={{color:ROLE_COLOR[m.role]}}>{fmt(mt)}</span>}
               </button>
             );
           })}
         </div>
       </div>
-
-      {/* Nav */}
       <nav className="p-4 flex-1">
         <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">功能選單</p>
         <div className="space-y-1">
@@ -1031,18 +1205,13 @@ export default function App() {
             <button key={id} onClick={()=>setTab(id)}
               className={`w-full flex items-center gap-3 px-4 py-3.5 rounded-xl text-left transition-all border-2 text-lg font-semibold
                 ${tab===id?"bg-blue-50 text-blue-700 border-blue-300 shadow-sm":"text-slate-600 border-transparent hover:bg-gray-50 hover:border-gray-200"}`}>
-              <Icon size={20}/>
-              {label}
+              <Icon size={20}/>{label}
             </button>
           ))}
         </div>
       </nav>
-
-      {/* WM mini */}
       <div className="p-4 border-t-2 border-gray-200 bg-gray-50">
-        <p className="text-base font-bold text-slate-700 mb-1">
-          {curWM.label} · {Math.round(getWMProgress()*100)}% 已過
-        </p>
+        <p className="text-base font-bold text-slate-700 mb-1">{curWM.label} · {Math.round(getWMProgress()*100)}% 已過</p>
         <ProgBar value={getWMProgress()} color="#2563eb" thick className="mb-2"/>
         <p className="text-sm font-bold text-red-600">結案截止 {toRoc(curWM.close)}</p>
       </div>
@@ -1051,19 +1220,12 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-gray-100 text-slate-900 font-sans">
-
-      {/* ── Top bar ── */}
-      <header className="sticky top-0 z-40 flex items-center gap-3 px-4 md:px-6 py-4
-        bg-white border-b-2 border-gray-200 shadow-sm">
-        {/* Hamburger — controls desktop sidebar + mobile drawer */}
-        <button
-          className="flex w-11 h-11 rounded-xl items-center justify-center text-slate-600
-            hover:bg-gray-100 hover:text-slate-900 border-2 border-gray-200 transition-all"
-          onClick={()=>{ setSideOpen(v=>!v); setDrawerOpen(v=>!v); }}
-          aria-label="開啟/關閉選單">
+      {/* Top bar */}
+      <header className="sticky top-0 z-40 flex items-center gap-3 px-4 md:px-6 py-4 bg-white border-b-2 border-gray-200 shadow-sm">
+        <button className="flex w-11 h-11 rounded-xl items-center justify-center text-slate-600 hover:bg-gray-100 hover:text-slate-900 border-2 border-gray-200 transition-all"
+          onClick={()=>{ setSideOpen(v=>!v); setDrawerOpen(v=>!v); }} aria-label="開啟/關閉選單">
           <Menu size={22}/>
         </button>
-
         <div className="flex items-center gap-3">
           <div className="w-2 h-10 rounded-full bg-gradient-to-b from-amber-400 to-amber-600 shrink-0"/>
           <div>
@@ -1071,75 +1233,49 @@ export default function App() {
             <p className="text-sm text-gray-500 font-medium leading-none mt-0.5">115 年度業績管理系統</p>
           </div>
         </div>
-
-        {/* Global KPIs — hidden on mobile */}
         <div className="hidden lg:flex items-center gap-6 ml-auto">
-          {[
-            {l:"全團壽險",v:globalL,c:"#2563eb"},
-            {l:"全團產險",v:globalNL,c:"#059669"},
-            {l:"全團總績效",v:globalL+globalNL,c:"#d97706"},
-          ].map(s=>(
+          {[{l:"全團壽險",v:globalL,c:"#2563eb"},{l:"全團產險",v:globalNL,c:"#059669"},{l:"全團總績效",v:globalL+globalNL,c:"#d97706"}].map(s=>(
             <div key={s.l} className="text-right">
               <p className="text-sm text-gray-500 font-medium leading-none">{s.l}</p>
-              <p className="text-2xl font-black tabular-nums leading-none mt-0.5" style={{color:s.c}}>
-                {fmt(s.v)}
-              </p>
+              <p className="text-2xl font-black tabular-nums leading-none mt-0.5" style={{color:s.c}}>{fmt(s.v)}</p>
             </div>
           ))}
         </div>
-
-        {/* Export */}
-        <button
-          className="ml-auto lg:ml-3 flex items-center gap-2 text-base font-semibold text-slate-600
-            hover:text-slate-900 px-4 py-2.5 rounded-xl border-2 border-gray-200 hover:border-gray-300 bg-white hover:bg-gray-50 transition-all"
-          onClick={()=>exportCSV(member,perf)}>
-          <Download size={18}/><span className="hidden sm:inline">匯出 CSV</span>
-        </button>
+        <div className="ml-auto lg:ml-3 flex items-center gap-2">
+          <CloudBadge/>
+          <button className="flex items-center gap-2 text-base font-semibold text-slate-600 hover:text-slate-900 px-4 py-2.5 rounded-xl border-2 border-gray-200 hover:border-gray-300 bg-white hover:bg-gray-50 transition-all"
+            onClick={()=>exportCSV(member,perf)}>
+            <Download size={18}/><span className="hidden sm:inline">匯出 CSV</span>
+          </button>
+        </div>
       </header>
 
       <div className="flex h-[calc(100svh-73px)]">
-
-        {/* ── Desktop sidebar ── */}
-        <aside className={`hidden md:flex flex-col shrink-0 overflow-hidden transition-all duration-300
-          border-r-2 border-gray-200 bg-white ${sideOpen?"w-72":"w-0"}`}>
-          <div className="w-72 overflow-y-auto h-full">
-            <SideContent/>
-          </div>
+        {/* Desktop sidebar */}
+        <aside className={`hidden md:flex flex-col shrink-0 overflow-hidden transition-all duration-300 border-r-2 border-gray-200 bg-white ${sideOpen?"w-72":"w-0"}`}>
+          <div className="w-72 overflow-y-auto h-full"><SideContent/></div>
         </aside>
 
-        {/* ── Mobile / tablet drawer overlay ── */}
-        {drawerOpen && (
+        {/* Mobile drawer */}
+        {drawerOpen&&(
           <div className="md:hidden fixed inset-0 z-50 flex">
-            {/* Backdrop */}
             <div className="absolute inset-0 bg-black/40" onClick={()=>setDrawerOpen(false)}/>
-            {/* Drawer */}
-            <div className="relative z-10 w-80 max-w-[85vw] bg-white h-full shadow-2xl flex flex-col
-              animate-[slideInLeft_0.25s_ease-out]"
-              style={{animation:"slideInLeft 0.25s ease-out"}}>
+            <div className="relative z-10 w-80 max-w-[85vw] bg-white h-full shadow-2xl flex flex-col" style={{animation:"slideInLeft 0.25s ease-out"}}>
               <div className="flex items-center justify-between px-4 py-4 border-b-2 border-gray-200">
                 <h2 className="text-xl font-black text-slate-900">選單</h2>
-                <button onClick={()=>setDrawerOpen(false)}
-                  className="w-10 h-10 rounded-xl flex items-center justify-center text-gray-500
-                    hover:bg-gray-100 border-2 border-gray-200 transition-colors">
-                  <X size={20}/>
-                </button>
+                <button onClick={()=>setDrawerOpen(false)} className="w-10 h-10 rounded-xl flex items-center justify-center text-gray-500 hover:bg-gray-100 border-2 border-gray-200"><X size={20}/></button>
               </div>
-              <div className="flex-1 overflow-y-auto">
-                <SideContent/>
-              </div>
+              <div className="flex-1 overflow-y-auto"><SideContent/></div>
             </div>
           </div>
         )}
 
-        {/* ── Main content ── */}
+        {/* Main */}
         <main className="flex-1 min-w-0 overflow-y-auto bg-gray-100">
           <div className="px-4 md:px-6 py-5 pb-28 md:pb-8 max-w-3xl mx-auto">
-
-            {/* Member header card */}
             <div className="flex items-center gap-4 mb-6 bg-white rounded-2xl border-2 border-gray-200 shadow-sm px-5 py-4">
               <div className="w-14 h-14 rounded-2xl flex items-center justify-center text-2xl font-black shrink-0"
-                style={{background:ROLE_BG[member?.role],color:ROLE_COLOR[member?.role],
-                  border:`3px solid ${ROLE_BORDER[member?.role]}`}}>
+                style={{background:ROLE_BG[member?.role],color:ROLE_COLOR[member?.role],border:`3px solid ${ROLE_BORDER[member?.role]}`}}>
                 {member?.name[0]}
               </div>
               <div className="flex-1">
@@ -1147,29 +1283,23 @@ export default function App() {
                   <h2 className="text-2xl font-black text-slate-900">{member?.name}</h2>
                   <Badge role={member?.role}/>
                 </div>
-                <p className="text-base text-gray-500 font-medium mt-0.5">
-                  {ROLES[member?.role]?.label}
-                </p>
+                <p className="text-base text-gray-500 font-medium mt-0.5">{ROLES[member?.role]?.label}</p>
               </div>
-              {/* Mobile: tab quick-switch */}
               <div className="hidden sm:flex md:hidden items-center gap-1">
                 {NAV.map(({id,icon:Icon})=>(
                   <button key={id} onClick={()=>setTab(id)}
-                    className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all border-2
-                      ${tab===id?"bg-blue-50 text-blue-600 border-blue-300":"text-gray-400 border-transparent hover:border-gray-200"}`}>
+                    className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all border-2 ${tab===id?"bg-blue-50 text-blue-600 border-blue-300":"text-gray-400 border-transparent hover:border-gray-200"}`}>
                     <Icon size={18}/>
                   </button>
                 ))}
               </div>
             </div>
-
-            {/* Page content */}
             {page}
           </div>
         </main>
       </div>
 
-      {/* ── Mobile bottom navigation ── */}
+      {/* Mobile bottom nav */}
       <nav className="md:hidden fixed bottom-0 left-0 right-0 z-30 flex bg-white border-t-2 border-gray-200 shadow-lg"
         style={{paddingBottom:"env(safe-area-inset-bottom,0)"}}>
         {NAV.map(({id,label,icon:Icon})=>{
@@ -1180,18 +1310,14 @@ export default function App() {
               style={{color:active?"#2563eb":"#6b7280",minHeight:60}}>
               <Icon size={22}/>
               <span className="text-sm font-bold">{label}</span>
-              {active && <div className="w-6 h-1 rounded-full bg-blue-600"/>}
+              {active&&<div className="w-6 h-1 rounded-full bg-blue-600"/>}
             </button>
           );
         })}
       </nav>
 
-      {/* Slide-in animation keyframe */}
       <style>{`
-        @keyframes slideInLeft {
-          from { transform: translateX(-100%); }
-          to   { transform: translateX(0); }
-        }
+        @keyframes slideInLeft { from{transform:translateX(-100%)} to{transform:translateX(0)} }
       `}</style>
     </div>
   );

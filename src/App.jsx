@@ -969,7 +969,7 @@ function PageBonus({ member, perf, meta, members, allPerf }) {
               {contest.group}
             </span>
             <span className="text-base font-bold text-gray-500">
-              每季達標 +{(CONTEST.bonus/10000).toFixed(0)}萬
+              每季達標 +{(CONTEST.bonus/1000).toFixed(0)}K（$25,000）
             </span>
           </div>
         </div>

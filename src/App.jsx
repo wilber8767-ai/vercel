@@ -1072,6 +1072,12 @@ export default function App() {
   // ── Cloud sync state ──────────────────────────────────────────
   const [cloudStatus, setCloudStatus] = useState(supabase?"loading":"offline");
   const [syncing, setSyncing] = useState(false);
+  const [toastMsg, setToastMsg] = useState(null); // { text, isError }
+
+  const showToast = useCallback((text, isError=false) => {
+    setToastMsg({ text, isError });
+    setTimeout(() => setToastMsg(null), 4000);
+  }, []);
 
   // ── Boot: fetch from Supabase, merge over localStorage ───────
   useEffect(()=>{
@@ -1101,46 +1107,71 @@ export default function App() {
         setCloudStatus("ok");
       }catch(e){
         console.error("[supabase] boot error:", e.message ?? e);
+        showToast(`連線失敗：${e.message ?? e}`, true);
         setCloudStatus("error");
       }
     })();
   },[]);
 
-  // ── Debounced upsert helpers ──────────────────────────────────
-  const debouncedUpsertPerf = useDebounce(async(agentName,workMonth,life,pc)=>{
-    setSyncing(true);
-    await upsertPerfRow(agentName,workMonth,life,pc);
-    setSyncing(false);
-  },800);
 
-  const debouncedUpsertMeta = useDebounce(async(agentName,meta)=>{
+  // ── Direct upsert helpers (no debounce — fires on every commit) ──
+  const syncPerf = useCallback(async (agentName, workMonth, life, pc) => {
     setSyncing(true);
-    await upsertMetaRow(agentName,meta);
-    setSyncing(false);
-  },800);
+    try {
+      await upsertPerfRow(agentName, workMonth, life, pc);
+    } catch(e) {
+      showToast(`儲存失敗：${e.message}`, true);
+    } finally {
+      setSyncing(false);
+    }
+  }, [showToast]);
 
-  // ── updatePerf: localStorage + Supabase upsert ───────────────
-  const updatePerf = useCallback((mi,col,val)=>{
-    setAllPerf(prev=>{
-      const next={...prev};
-      const row=(next[selectedId]??emptyPerf()).map(r=>[...r]);
-      row[mi][col]=val; next[selectedId]=row;
-      lsSet(LS.PERF,next);
-      const name=members.find(m=>m.id===selectedId)?.name??selectedId;
-      debouncedUpsertPerf(name,mi+1,row[mi][0],row[mi][1]);
+  const syncMeta = useCallback(async (agentName, meta) => {
+    setSyncing(true);
+    try {
+      await upsertMetaRow(agentName, meta);
+    } catch(e) {
+      showToast(`Meta 儲存失敗：${e.message}`, true);
+    } finally {
+      setSyncing(false);
+    }
+  }, [showToast]);
+
+  // ── updatePerf: write localStorage then immediately upsert ───
+  const updatePerf = useCallback((mi, col, val) => {
+    const agentName = members.find(m => m.id === selectedId)?.name ?? selectedId;
+    // Capture both columns after update so upsert gets the full row
+    let life = 0, pc = 0;
+    setAllPerf(prev => {
+      const next = { ...prev };
+      const row  = (next[selectedId] ?? emptyPerf()).map(r => [...r]);
+      row[mi][col] = val;
+      next[selectedId] = row;
+      lsSet(LS.PERF, next);
+      life = Number(row[mi][0]) || 0;
+      pc   = Number(row[mi][1]) || 0;
       return next;
     });
-  },[selectedId,members,debouncedUpsertPerf]);
+    // Fire upsert immediately after state update queued
+    // Use setTimeout(0) so the closure above runs first and captures latest values
+    setTimeout(() => {
+      syncPerf(agentName, mi + 1, life, pc)
+        .catch(e => console.error("[updatePerf] sync failed:", e));
+    }, 0);
+  }, [selectedId, members, syncPerf]);
 
-  // ── updateMeta: localStorage + Supabase upsert ───────────────
-  const updateMeta = useCallback(nm=>{
-    setAllMeta(prev=>{
-      const next={...prev,[selectedId]:nm}; lsSet(LS.META,next);
-      const name=members.find(m=>m.id===selectedId)?.name??selectedId;
-      debouncedUpsertMeta(name,nm);
+  // ── updateMeta: write localStorage then immediately upsert ───
+  const updateMeta = useCallback(nm => {
+    const agentName = members.find(m => m.id === selectedId)?.name ?? selectedId;
+    setAllMeta(prev => {
+      const next = { ...prev, [selectedId]: nm };
+      lsSet(LS.META, next);
       return next;
     });
-  },[selectedId,members,debouncedUpsertMeta]);
+    setTimeout(() => {
+      syncMeta(agentName, nm).catch(e => console.error("[updateMeta] sync failed:", e));
+    }, 0);
+  }, [selectedId, members, syncMeta]);
 
   const member = members.find(m=>m.id===selectedId)??members[0];
   const perf   = allPerf[selectedId]??emptyPerf();
@@ -1336,8 +1367,41 @@ export default function App() {
         })}
       </nav>
 
+      {/* ── Corner cloud status badge ── */}
+      <div className="fixed bottom-20 md:bottom-4 right-4 z-50 flex flex-col items-end gap-2 pointer-events-none">
+        {/* Toast notification */}
+        {toastMsg && (
+          <div className={`pointer-events-auto px-4 py-2.5 rounded-xl border-2 shadow-lg text-sm font-semibold
+            transition-all animate-fade-in
+            ${toastMsg.isError
+              ? "bg-red-50 border-red-300 text-red-700"
+              : "bg-green-50 border-green-300 text-green-700"}`}>
+            {toastMsg.text}
+          </div>
+        )}
+        {/* Persistent status pill */}
+        <div className={`px-3 py-1.5 rounded-full border text-xs font-bold flex items-center gap-1.5
+          ${cloudStatus==="ok" && !syncing ? "bg-green-50 border-green-300 text-green-700"
+          : cloudStatus==="error"          ? "bg-red-50 border-red-200 text-red-500"
+          : cloudStatus==="offline"        ? "bg-gray-50 border-gray-200 text-gray-500"
+          :                                  "bg-blue-50 border-blue-200 text-blue-600"}`}>
+          <span className={`w-2 h-2 rounded-full inline-block ${
+            cloudStatus==="ok" && !syncing ? "bg-green-500"
+            : cloudStatus==="error"        ? "bg-red-400"
+            : cloudStatus==="offline"      ? "bg-gray-400"
+            :                               "bg-blue-500 animate-pulse"}`}/>
+          {syncing            ? "同步中…"
+           : cloudStatus==="ok"      ? "雲端已連線"
+           : cloudStatus==="error"   ? "連線失敗"
+           : cloudStatus==="offline" ? "本機模式"
+           :                          "連線中"}
+        </div>
+      </div>
+
       <style>{`
         @keyframes slideInLeft { from{transform:translateX(-100%)} to{transform:translateX(0)} }
+        @keyframes fade-in { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+        .animate-fade-in { animation: fade-in 0.2s ease-out; }
       `}</style>
     </div>
   );

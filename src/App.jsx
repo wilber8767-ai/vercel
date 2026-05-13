@@ -257,9 +257,12 @@ const LS = { PERF:"sps_perf_v1", META:"sps_meta_v1", MEMBERS:"sps_members_v1" };
 // §2  HELPERS
 // ═══════════════════════════════════════════════════════════════
 
-const safe   = (v) => Math.max(0, Number(v) || 0);
-const sumArr = (a) => a.reduce((s,v) => s+v, 0);
-const emptyPerf = () => Array(12).fill(null).map(() => [0,0]);
+const safe   = (v) => { const n = Number(v); return isFinite(n) && n > 0 ? n : 0; };
+const sumArr = (a) => a.reduce((s,v) => s + (isFinite(v) ? v : 0), 0);
+const emptyPerf = () => Array(12).fill(null).map(() => [0, 0]);
+
+// Guard a perf row: ensures both values are clean non-negative finite numbers
+const safeRow = (row) => [safe(row?.[0]), safe(row?.[1])];
 
 function fmt(n, compact=true) {
   if (n === 0) return "–";
@@ -299,11 +302,17 @@ function calcOverriding(ftm, role) {
   const c=ROLES[role]; if(!c.overriding||!c.target) return 0;
   return ftm>c.target?Math.round((ftm-c.target)*c.overriding):0;
 }
+// FYC tier lookup — returns { min, rate, label }
+// 使用具名物件避免解構順序出錯
 function getFycTier(total, newcomer=false) {
-  const eff=newcomer?total*2:total;
-  return FYC_TIERS.find(([m])=>eff>=m)??FYC_TIERS.at(-1);
+  const eff = newcomer ? total * 2 : total;
+  const tier = FYC_TIERS.find(([m]) => eff >= m) ?? FYC_TIERS.at(-1);
+  return { min: tier[0], rate: tier[1], label: tier[2] };
 }
-function getQTier(qt) { return Q_TIERS.find(([m])=>qt>=m)??Q_TIERS.at(-1); }
+function getQTier(qt) {
+  const tier = Q_TIERS.find(([m]) => qt >= m) ?? Q_TIERS.at(-1);
+  return { min: tier[0], rate: tier[1], label: tier[2] };
+}
 
 function lsGet(k,fb) { try{const v=localStorage.getItem(k);return v?JSON.parse(v):fb;}catch{return fb;} }
 function lsSet(k,v)  { try{localStorage.setItem(k,JSON.stringify(v));}catch{} }
@@ -611,8 +620,10 @@ function PageTargets({ member, perf, meta, onMetaUpdate }) {
   const yearNL = sumArr(perf.map(r=>safe(r[1])));
   const yearT  = yearL+yearNL;
   const isNew  = meta.isNewcomer||false;
-  const [fycR,,fycLbl] = getFycTier(yearT,isNew);
-  const fycBonus = Math.round(yearT*fycR);
+  const fycTierObj = getFycTier(yearT, isNew);
+  const fycR     = fycTierObj.rate;
+  const fycLbl   = fycTierObj.label;
+  const fycBonus = Math.round(yearT * fycR);
   const mTgt   = (meta.lifeTarget||0)+(meta.nlTarget||0);
   const filled = perf.filter(r=>safe(r[0])+safe(r[1])>0).length;
   const avgAct = filled>0?yearT/filled:0;
@@ -695,8 +706,8 @@ function PageTargets({ member, perf, meta, onMetaUpdate }) {
         <div className="relative mb-7">
           <div className="h-5 rounded-full overflow-hidden bg-gray-200">
             <div className="h-full flex">
-              <div style={{width:`${Math.min(100,yearL/9000)}%`,background:"#2563eb"}}/>
-              <div style={{width:`${Math.min(100-yearL/9000,yearNL/9000)}%`,background:"#059669"}}/>
+              <div style={{width:`${Math.min(100, yearL/900000*100)}%`,background:"#2563eb"}}/>
+              <div style={{width:`${Math.min(Math.max(0,100-yearL/900000*100), yearNL/900000*100)}%`,background:"#059669"}}/>
             </div>
           </div>
           {FYC_TIERS.slice(0,-1).map(([m,,lbl])=>{
@@ -805,33 +816,66 @@ function PageTargets({ member, perf, meta, onMetaUpdate }) {
 
 function PageBonus({ member, perf, meta, members, allPerf }) {
   const role  = member.role;
-  const yearT = sumArr(perf.map(r=>safe(r[0])+safe(r[1])));
-  const isNew = meta.isNewcomer||false;
-  const quarters=[[0,1,2],[3,4,5],[6,7,8],[9,10,11]].map((mis,qi)=>{
-    const qt=sumArr(mis.map(mi=>safe(perf[mi]?.[0])+safe(perf[mi]?.[1])));
-    const [,rate,lbl]=getQTier(qt);
-    return {label:`Q${qi+1}`,total:qt,rate,tierLabel:lbl,bonus:Math.round(qt*rate)};
+
+  // ── 每月實績（用 safeRow 防止 DB 字串/undefined 造成 NaN）──────
+  const monthly12 = Array(12).fill(0).map((_, mi) => {
+    const [l, nl] = safeRow(perf[mi]);
+    return { life: l, nonLife: nl, total: l + nl };
   });
-  const act  = sumArr(perf.map(r=>activityBonus(safe(r[0])+safe(r[1]),role)));
-  const qB   = sumArr(quarters.map(q=>q.bonus));
-  const ye   = Math.round(act*0.18);
-  const [fycR,,fycLbl]=getFycTier(yearT,isNew);
-  const fycB = Math.round(yearT*fycR);
-  const pers = act+qB+ye+fycB;
-  const isMgr=ROLES[role]?.isManager;
-  let bsY=0,ovY=0;
-  if(isMgr){
-    const cas=members.filter(m=>m.parentId===member.id&&m.role==="CA");
-    bsY=sumArr(Array(12).fill(0).map((_,mi)=>{
-      const dgm=sumArr([member.id,...cas.map(c=>c.id)].map(id=>safe(allPerf[id]?.[mi]?.[0])+safe(allPerf[id]?.[mi]?.[1])));
-      return calcBaseSalary(dgm,role).salary;
-    }));
-    ovY=sumArr(Array(12).fill(0).map((_,mi)=>{
-      const ftm=sumArr(members.map(m2=>safe(allPerf[m2.id]?.[mi]?.[0])+safe(allPerf[m2.id]?.[mi]?.[1])));
-      return calcOverriding(ftm,role);
-    }));
+
+  const yearT = Math.round(sumArr(monthly12.map(m => m.total)));
+  const isNew = meta.isNewcomer || false;
+
+  // ── 季獎金 ────────────────────────────────────────────────────
+  const quarters = [[0,1,2],[3,4,5],[6,7,8],[9,10,11]].map((mis, qi) => {
+    const qt = Math.round(sumArr(mis.map(mi => monthly12[mi].total)));
+    const qTierObj = getQTier(qt);
+    return { label:`Q${qi+1}`, total:qt, rate:qTierObj.rate, tierLabel:qTierObj.label, bonus:Math.round(qt * qTierObj.rate) };
+  });
+
+  // ── 實動津貼（每月加總，Math.round 防小數）────────────────────
+  const act  = Math.round(sumArr(monthly12.map(m => activityBonus(m.total, role))));
+
+  // ── 季獎金合計 ────────────────────────────────────────────────
+  const qB   = Math.round(sumArr(quarters.map(q => q.bonus)));
+
+  // ── 個人年終 = 實動津貼 × 18% ────────────────────────────────
+  const ye   = Math.round(act * 0.18);
+
+  // ── FYC 年終 = 年度總實績 × 級距百分比 ───────────────────────
+  const fycTierObj2 = getFycTier(yearT, isNew);
+  const fycR   = fycTierObj2.rate;
+  const fycLbl = fycTierObj2.label;
+  const fycB   = Math.round(yearT * fycR);   // 例：300,000 × 10% = 30,000
+
+  // ── 個人部分小計 ──────────────────────────────────────────────
+  const pers = act + qB + ye + fycB;
+
+  const isMgr = ROLES[role]?.isManager;
+  let bsY = 0, ovY = 0;
+
+  if (isMgr) {
+    // 直轄 CA
+    const cas = members.filter(m => m.parentId === member.id && m.role === "CA");
+    bsY = Math.round(sumArr(Array(12).fill(0).map((_, mi) => {
+      const dgm = Math.round(sumArr(
+        [member.id, ...cas.map(c => c.id)].map(id => {
+          const [l, nl] = safeRow(allPerf[id]?.[mi]);
+          return l + nl;
+        })
+      ));
+      return calcBaseSalary(dgm, role).salary;
+    })));
+    ovY = Math.round(sumArr(Array(12).fill(0).map((_, mi) => {
+      const ftm = Math.round(sumArr(members.map(m2 => {
+        const [l, nl] = safeRow(allPerf[m2.id]?.[mi]);
+        return l + nl;
+      })));
+      return calcOverriding(ftm, role);
+    })));
   }
-  const grand=pers+bsY+ovY;
+
+  const grand = pers + bsY + ovY;
 
   return (
     <div className="space-y-6">

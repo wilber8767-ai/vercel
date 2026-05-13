@@ -43,45 +43,77 @@ const TABLE     = "sales_data";
 const supabase = SUPA_URL && SUPA_KEY ? createClient(SUPA_URL, SUPA_KEY) : null;
 
 /**
- * 從 Supabase 讀取所有業績記錄，轉換成 allPerf 格式
- * { [agent_name]: [[life_fyc, p_c_premium], ...] × 12 }
+ * 從 Supabase 讀取所有業績，轉換成 allPerf 格式
+ * key = member.id（如 "GHY"），不是姓名
+ * { [member_id]: [[life_fyc, p_c_premium], ...] × 12 }
  */
-async function fetchAllPerf() {
+async function fetchAllPerf(members) {
   if (!supabase) return null;
+
   const { data, error } = await supabase
-    .from(TABLE)
-    .select("agent_name, work_month, life_fyc, p_c_premium, is_active, recruits");
-  if (error) { console.error("[supabase] fetch error:", error.message); return null; }
+    .from(TABLE)               // sales_data
+    .select("agent_name, work_month, life_fyc, p_c_premium");
+
+  if (error) {
+    console.error("[supabase] fetchAllPerf error:", error.message);
+    return null;
+  }
+
+  console.log("抓到的雲端資料:", data);   // ← 偵錯用，確認雲端有東西
+
+  // 建立「姓名 → member.id」的對照表（確保對齊）
+  const nameToId = {};
+  for (const m of members) nameToId[m.name] = m.id;
 
   const result = {};
   for (const row of data) {
-    const id = row.agent_name;
-    if (!result[id]) result[id] = Array(12).fill(null).map(()=>[0,0]);
-    const mi = row.work_month - 1; // DB stores 1-12, array is 0-11
+    const memberId = nameToId[row.agent_name];
+    if (!memberId) {
+      console.warn("[fetch] 未知姓名，跳過:", row.agent_name);
+      continue;
+    }
+    if (!result[memberId]) result[memberId] = Array(12).fill(null).map(() => [0, 0]);
+    const mi = Number(row.work_month) - 1;   // 強制轉 Number，DB 1-12 → array 0-11
     if (mi >= 0 && mi < 12) {
-      result[id][mi] = [Number(row.life_fyc)||0, Number(row.p_c_premium)||0];
+      result[memberId][mi] = [Number(row.life_fyc) || 0, Number(row.p_c_premium) || 0];
     }
   }
+  console.log("[fetch] 轉換後 allPerf:", result);
   return result;
 }
 
 /**
- * 從 Supabase 讀取 meta（recruits, is_active 等），轉換成 allMeta 格式
+ * 從 Supabase 讀取 meta（recruits, is_active），轉換成 allMeta 格式
  */
-async function fetchAllMeta() {
+async function fetchAllMeta(members) {
   if (!supabase) return null;
+
   const { data, error } = await supabase
     .from(TABLE)
     .select("agent_name, work_month, is_active, recruits");
-  if (error) { console.error("[supabase] meta fetch error:", error.message); return null; }
+
+  if (error) {
+    console.error("[supabase] fetchAllMeta error:", error.message);
+    return null;
+  }
+
+  const nameToId = {};
+  for (const m of members) nameToId[m.name] = m.id;
 
   const result = {};
   for (const row of data) {
-    if (!result[row.agent_name]) result[row.agent_name] = {};
-    // 合併 recruits（只取最新一筆有值的記錄，work_month=1 作為 meta 行）
-    if (row.work_month === 1 && row.recruits) {
-      try { result[row.agent_name].recruits = JSON.parse(row.recruits); }
-      catch { result[row.agent_name].recruits = row.recruits ?? []; }
+    const memberId = nameToId[row.agent_name];
+    if (!memberId) continue;
+    if (!result[memberId]) result[memberId] = {};
+    // work_month=1 那一行存放 meta
+    if (Number(row.work_month) === 1 && row.recruits) {
+      try {
+        result[memberId].recruits = typeof row.recruits === "string"
+          ? JSON.parse(row.recruits)
+          : row.recruits;
+      } catch {
+        result[memberId].recruits = [];
+      }
     }
   }
   return result;
@@ -1106,31 +1138,47 @@ export default function App() {
     setTimeout(() => setToastMsg(null), 4000);
   }, []);
 
-  // ── Boot: fetch from Supabase, merge over localStorage ───────
+  // ── Boot: fetch from Supabase, apply over localStorage ──────
   useEffect(()=>{
     if(!supabase){
       console.warn("[supabase] No client — VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY missing");
       return;
     }
-    console.log("[supabase] client ready, booting from", TABLE);
+    console.log("[supabase] client ready, TABLE =", TABLE);
     (async()=>{
       try{
-        // Quick connection test first
+        // 1. Connection test
         const test = await supabase.from(TABLE).select("agent_name").limit(1);
         if(test.error) throw test.error;
-        console.log("[supabase] connection OK, fetching all data…");
+        console.log("[supabase] connection OK ✓");
 
-        const [cp,cm] = await Promise.all([fetchAllPerf(), fetchAllMeta()]);
-        if(cp){ setAllPerf(cp); lsSet(LS.PERF,cp); }
-        if(cm){
-          setAllMeta(prev=>{
-            const merged={...prev};
-            Object.entries(cm).forEach(([id,m])=>{ merged[id]={...prev[id],...m}; });
-            lsSet(LS.META,merged);
+        // 2. Fetch — pass members so name→id mapping works
+        const currentMembers = lsGet(LS.MEMBERS, DEFAULT_MEMBERS);
+        console.log("[supabase] fetching with member list:", currentMembers.map(m=>`${m.name}(${m.id})`));
+
+        const [cp, cm] = await Promise.all([
+          fetchAllPerf(currentMembers),
+          fetchAllMeta(currentMembers),
+        ]);
+
+        if (cp) {
+          console.log("[supabase] allPerf loaded:", cp);
+          setAllPerf(cp);
+          lsSet(LS.PERF, cp);
+        } else {
+          console.warn("[supabase] fetchAllPerf returned null");
+        }
+
+        if (cm) {
+          setAllMeta(prev => {
+            const merged = { ...prev };
+            Object.entries(cm).forEach(([id, m]) => { merged[id] = { ...prev[id], ...m }; });
+            lsSet(LS.META, merged);
             return merged;
           });
         }
-        console.log("[supabase] boot complete");
+
+        console.log("[supabase] boot complete ✓");
         setCloudStatus("ok");
       }catch(e){
         console.error("[supabase] boot error:", e.message ?? e);
@@ -1298,6 +1346,22 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-gray-100 text-slate-900 font-sans">
+
+      {/* ── 頂部讀取中提示條 ── */}
+      {cloudStatus === "loading" && (
+        <div className="fixed top-0 left-0 right-0 z-50">
+          <div className="h-1 bg-blue-200 overflow-hidden">
+            <div className="h-full bg-blue-600 animate-pulse" style={{width:"60%"}}/>
+          </div>
+          <div className="flex items-center justify-center gap-2 bg-blue-600 text-white text-sm font-semibold py-1.5">
+            <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+            </svg>
+            讀取中…正在從雲端載入資料
+          </div>
+        </div>
+      )}
       {/* Top bar */}
       <header className="sticky top-0 z-40 flex items-center gap-3 px-4 md:px-6 py-4 bg-white border-b-2 border-gray-200 shadow-sm">
         <button className="flex w-11 h-11 rounded-xl items-center justify-center text-slate-600 hover:bg-gray-100 hover:text-slate-900 border-2 border-gray-200 transition-all"

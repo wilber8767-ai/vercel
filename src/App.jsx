@@ -89,35 +89,62 @@ async function fetchAllMeta() {
 
 /**
  * 將單一業績格更新至 Supabase（upsert）
- * PK: (agent_name, work_month)
+ * PK: (agent_name, work_month) — onConflict 陣列格式確保覆蓋不重複新增
  */
 async function upsertPerfRow(agentName, workMonth, lifeFyc, pcPremium) {
-  if (!supabase) { console.warn("[supabase] client not initialised — check env vars"); return; }
-  console.log("[supabase] upserting perf:", agentName, workMonth, lifeFyc, pcPremium);
-  const { data, error } = await supabase.from(TABLE).upsert({
-    agent_name:  agentName,
-    work_month:  workMonth,
-    life_fyc:    lifeFyc,
-    p_c_premium: pcPremium,
-  }, { onConflict: "agent_name,work_month" }).select();
-  if (error) console.error("[supabase] upsert error:", error.message, error.details, error.hint);
-  else       console.log("[supabase] upsert ok:", data);
+  if (!supabase) {
+    alert("錯誤原因：Supabase 未初始化，請確認環境變數 VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY");
+    return;
+  }
+  console.log("[supabase] upsert perf →", { agentName, workMonth, lifeFyc, pcPremium });
+
+  const { data, error } = await supabase
+    .from(TABLE)                          // 'sales_data'
+    .upsert(
+      {
+        agent_name:  agentName,           // 姓名
+        work_month:  workMonth,           // 月份 (1-12)
+        life_fyc:    lifeFyc,             // 壽險業績
+        p_c_premium: pcPremium,           // 產險保費
+      },
+      { onConflict: ["agent_name", "work_month"] }   // ← 陣列格式，確保覆蓋
+    )
+    .select();
+
+  if (error) {
+    console.error("[supabase] upsert error:", error);
+    alert("錯誤原因：" + error.message);
+  } else {
+    console.log("[supabase] upsert ok:", data);
+    alert("儲存成功");
+  }
 }
 
 /**
  * 將 meta（recruits / is_active）更新至 Supabase
- * 寫入 work_month=1 那一行的 recruits 欄位
+ * 寫入 work_month=1 那一行
  */
 async function upsertMetaRow(agentName, meta) {
-  if (!supabase) { console.warn("[supabase] client not initialised — check env vars"); return; }
-  console.log("[supabase] upserting meta:", agentName);
-  const { data, error } = await supabase.from(TABLE).upsert({
-    agent_name: agentName,
-    work_month: 1,
-    recruits:   JSON.stringify(meta.recruits ?? []),
-    is_active:  meta.isActive ?? true,
-  }, { onConflict: "agent_name,work_month" }).select();
-  if (error) console.error("[supabase] meta upsert error:", error.message, error.details, error.hint);
+  if (!supabase) {
+    console.warn("[supabase] client not initialised — check env vars");
+    return;
+  }
+  console.log("[supabase] upsert meta →", agentName);
+
+  const { data, error } = await supabase
+    .from(TABLE)
+    .upsert(
+      {
+        agent_name: agentName,            // 姓名
+        work_month: 1,                    // meta 行固定存在第1月
+        recruits:   JSON.stringify(meta.recruits ?? []),  // 增員人數
+        is_active:  meta.isActive ?? true,                // 是否實動
+      },
+      { onConflict: ["agent_name", "work_month"] }
+    )
+    .select();
+
+  if (error) console.error("[supabase] meta upsert error:", error.message, error.details);
   else       console.log("[supabase] meta upsert ok:", data);
 }
 

@@ -8,7 +8,7 @@
  *   VITE_SUPABASE_URL=https://your-project.supabase.co
  *   VITE_SUPABASE_ANON_KEY=your-anon-key
  *
- * Supabase 資料表：sales_records
+ * Supabase 資料表：sales_data
  *   欄位：agent_name (text PK), work_month (int2 PK),
  *          life_fyc (numeric), p_c_premium (numeric),
  *          is_active (bool), recruits (jsonb)
@@ -92,14 +92,16 @@ async function fetchAllMeta() {
  * PK: (agent_name, work_month)
  */
 async function upsertPerfRow(agentName, workMonth, lifeFyc, pcPremium) {
-  if (!supabase) return;
-  const { error } = await supabase.from(TABLE).upsert({
+  if (!supabase) { console.warn("[supabase] client not initialised — check env vars"); return; }
+  console.log("[supabase] upserting perf:", agentName, workMonth, lifeFyc, pcPremium);
+  const { data, error } = await supabase.from(TABLE).upsert({
     agent_name:  agentName,
-    work_month:  workMonth,    // 1-indexed
+    work_month:  workMonth,
     life_fyc:    lifeFyc,
     p_c_premium: pcPremium,
-  }, { onConflict: "agent_name,work_month" });
-  if (error) console.error("[supabase] upsert error:", error.message);
+  }, { onConflict: "agent_name,work_month" }).select();
+  if (error) console.error("[supabase] upsert error:", error.message, error.details, error.hint);
+  else       console.log("[supabase] upsert ok:", data);
 }
 
 /**
@@ -107,23 +109,28 @@ async function upsertPerfRow(agentName, workMonth, lifeFyc, pcPremium) {
  * 寫入 work_month=1 那一行的 recruits 欄位
  */
 async function upsertMetaRow(agentName, meta) {
-  if (!supabase) return;
-  const { error } = await supabase.from(TABLE).upsert({
+  if (!supabase) { console.warn("[supabase] client not initialised — check env vars"); return; }
+  console.log("[supabase] upserting meta:", agentName);
+  const { data, error } = await supabase.from(TABLE).upsert({
     agent_name: agentName,
     work_month: 1,
     recruits:   JSON.stringify(meta.recruits ?? []),
     is_active:  meta.isActive ?? true,
-  }, { onConflict: "agent_name,work_month" });
-  if (error) console.error("[supabase] meta upsert error:", error.message);
+  }, { onConflict: "agent_name,work_month" }).select();
+  if (error) console.error("[supabase] meta upsert error:", error.message, error.details, error.hint);
+  else       console.log("[supabase] meta upsert ok:", data);
 }
 
-// Debounce helper — prevents flooding Supabase with every keystroke
+// Debounce helper — stable ref pattern prevents stale closures & timer leaks
 function useDebounce(fn, delay=800) {
-  const timer = useRef(null);
+  const timer  = useRef(null);
+  const fnRef  = useRef(fn);
+  // Keep fnRef always pointing at latest fn without re-creating the debounced fn
+  useEffect(() => { fnRef.current = fn; });
   return useCallback((...args) => {
     clearTimeout(timer.current);
-    timer.current = setTimeout(()=>fn(...args), delay);
-  }, [fn, delay]);
+    timer.current = setTimeout(() => { fnRef.current(...args); }, delay);
+  }, [delay]);  // only re-create if delay changes
 }
 
 
@@ -1068,9 +1075,18 @@ export default function App() {
 
   // ── Boot: fetch from Supabase, merge over localStorage ───────
   useEffect(()=>{
-    if(!supabase) return;
+    if(!supabase){
+      console.warn("[supabase] No client — VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY missing");
+      return;
+    }
+    console.log("[supabase] client ready, booting from", TABLE);
     (async()=>{
       try{
+        // Quick connection test first
+        const test = await supabase.from(TABLE).select("agent_name").limit(1);
+        if(test.error) throw test.error;
+        console.log("[supabase] connection OK, fetching all data…");
+
         const [cp,cm] = await Promise.all([fetchAllPerf(), fetchAllMeta()]);
         if(cp){ setAllPerf(cp); lsSet(LS.PERF,cp); }
         if(cm){
@@ -1081,8 +1097,12 @@ export default function App() {
             return merged;
           });
         }
+        console.log("[supabase] boot complete");
         setCloudStatus("ok");
-      }catch(e){ console.error("[supabase] boot:",e); setCloudStatus("error"); }
+      }catch(e){
+        console.error("[supabase] boot error:", e.message ?? e);
+        setCloudStatus("error");
+      }
     })();
   },[]);
 

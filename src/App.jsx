@@ -253,6 +253,15 @@ const DEFAULT_MEMBERS = [
 
 const LS = { PERF:"sps_perf_v1", META:"sps_meta_v1", MEMBERS:"sps_members_v1" };
 
+// ── 四季競賽獎金設定 ──────────────────────────────────────────
+const CONTEST = {
+  bonus: 25000,                       // 每季達標獎金
+  newbieIds: ["ZCX","LGY"],           // 新人組：鍾承修、林冠佑
+  // 達標條件
+  newbie:  { monthlyMin:40000, quarterTotal:130000 },  // 連三月每月≥4萬 OR 季總≥13萬
+  regular: { monthlyMin:50000, quarterTotal:180000 },  // 連三月每月≥5萬 OR 季總≥18萬
+};
+
 // ═══════════════════════════════════════════════════════════════
 // §2  HELPERS
 // ═══════════════════════════════════════════════════════════════
@@ -313,6 +322,50 @@ function getQTier(qt) {
   const tier = Q_TIERS.find(([m]) => qt >= m) ?? Q_TIERS.at(-1);
   return { min: tier[0], rate: tier[1], label: tier[2] };
 }
+
+/**
+ * 計算四季競賽獎金
+ * @param {string} memberId  - 成員 ID
+ * @param {Array}  perf      - 該成員的 12 個月業績陣列 [[life,nonLife], ...]
+ * @returns {{ quarters: Array, totalBonus: number }}
+ *   quarters[i] = { label, lifeTotal, passed, reason, bonus }
+ */
+function calcContestBonus(memberId, perf) {
+  const isNewbie = CONTEST.newbieIds.includes(memberId);
+  const rules    = isNewbie ? CONTEST.newbie : CONTEST.regular;
+  const group    = isNewbie ? "新人組" : "個人組";
+
+  const quarterDefs = [
+    { label:"Q1", mis:[0,1,2]  },
+    { label:"Q2", mis:[3,4,5]  },
+    { label:"Q3", mis:[6,7,8]  },
+    { label:"Q4", mis:[9,10,11]},
+  ];
+
+  let totalBonus = 0;
+  const quarters = quarterDefs.map(({ label, mis }) => {
+    // 只計入壽險 life_fyc（欄位 index 0）
+    const lifeMos  = mis.map(mi => safe(perf[mi]?.[0]));
+    const lifeTotal = Math.round(sumArr(lifeMos));
+
+    // 條件一：三個月每月都達標
+    const allMonthly = lifeMos.every(l => l >= rules.monthlyMin);
+    // 條件二：季總達標
+    const totalOK    = lifeTotal >= rules.quarterTotal;
+
+    const passed = allMonthly || totalOK;
+    const reason = passed
+      ? (allMonthly ? `連三月≥${(rules.monthlyMin/10000).toFixed(0)}萬` : `季總≥${(rules.quarterTotal/10000).toFixed(0)}萬`)
+      : `未達標`;
+    const bonus = passed ? CONTEST.bonus : 0;
+    totalBonus += bonus;
+
+    return { label, lifeTotal, lifeMos, passed, reason, bonus, group, rules };
+  });
+
+  return { quarters, totalBonus, isNewbie, group };
+}
+
 
 function lsGet(k,fb) { try{const v=localStorage.getItem(k);return v?JSON.parse(v):fb;}catch{return fb;} }
 function lsSet(k,v)  { try{localStorage.setItem(k,JSON.stringify(v));}catch{} }
@@ -826,36 +879,39 @@ function PageBonus({ member, perf, meta, members, allPerf }) {
   const yearT = Math.round(sumArr(monthly12.map(m => m.total)));
   const isNew = meta.isNewcomer || false;
 
-  // ── 季獎金 ────────────────────────────────────────────────────
+  // ── 季獎金（業績比例制）────────────────────────────────────
   const quarters = [[0,1,2],[3,4,5],[6,7,8],[9,10,11]].map((mis, qi) => {
     const qt = Math.round(sumArr(mis.map(mi => monthly12[mi].total)));
     const qTierObj = getQTier(qt);
     return { label:`Q${qi+1}`, total:qt, rate:qTierObj.rate, tierLabel:qTierObj.label, bonus:Math.round(qt * qTierObj.rate) };
   });
 
-  // ── 實動津貼（每月加總，Math.round 防小數）────────────────────
-  const act  = Math.round(sumArr(monthly12.map(m => activityBonus(m.total, role))));
+  // ── 四季競賽獎金（壽險條件制）────────────────────────────
+  const contest = calcContestBonus(member.id, perf);
+  const contestTotal = contest.totalBonus; // 0–100,000
 
-  // ── 季獎金合計 ────────────────────────────────────────────────
-  const qB   = Math.round(sumArr(quarters.map(q => q.bonus)));
+  // ── 實動津貼 ────────────────────────────────────────────────
+  const act = Math.round(sumArr(monthly12.map(m => activityBonus(m.total, role))));
+
+  // ── 季獎金合計（比例制 + 競賽制）────────────────────────────
+  const qB = Math.round(sumArr(quarters.map(q => q.bonus)));
 
   // ── 個人年終 = 實動津貼 × 18% ────────────────────────────────
-  const ye   = Math.round(act * 0.18);
+  const ye = Math.round(act * 0.18);
 
-  // ── FYC 年終 = 年度總實績 × 級距百分比 ───────────────────────
+  // ── FYC 年終 ────────────────────────────────────────────────
   const fycTierObj2 = getFycTier(yearT, isNew);
   const fycR   = fycTierObj2.rate;
   const fycLbl = fycTierObj2.label;
-  const fycB   = Math.round(yearT * fycR);   // 例：300,000 × 10% = 30,000
+  const fycB   = Math.round(yearT * fycR);
 
-  // ── 個人部分小計 ──────────────────────────────────────────────
-  const pers = act + qB + ye + fycB;
+  // ── 個人部分小計（含競賽獎金）────────────────────────────
+  const pers = act + qB + contestTotal + ye + fycB;
 
   const isMgr = ROLES[role]?.isManager;
   let bsY = 0, ovY = 0;
 
   if (isMgr) {
-    // 直轄 CA
     const cas = members.filter(m => m.parentId === member.id && m.role === "CA");
     bsY = Math.round(sumArr(Array(12).fill(0).map((_, mi) => {
       const dgm = Math.round(sumArr(
@@ -879,9 +935,9 @@ function PageBonus({ member, perf, meta, members, allPerf }) {
 
   return (
     <div className="space-y-6">
-      {/* Q cards */}
+      {/* Q cards — 比例制獎金 */}
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-        {quarters.map(q=>(
+        {quarters.map(q => (
           <div key={q.label} className="bg-white rounded-2xl border-2 border-gray-200 shadow-sm p-4">
             <div className="flex items-center justify-between mb-3">
               <span className="text-xl font-black text-slate-900">{q.label}</span>
@@ -892,25 +948,101 @@ function PageBonus({ member, perf, meta, members, allPerf }) {
             <p className="text-2xl font-black text-slate-900 tabular-nums mb-2">{fmt(q.total)}</p>
             <ProgBar value={q.total} max={150000} color="#d97706" thick className="mb-2"/>
             <div className="flex justify-between text-sm">
-              <span className="text-gray-500 font-medium">季獎金</span>
+              <span className="text-gray-500 font-medium">比例獎金</span>
               <span className="font-black text-amber-700 tabular-nums">{q.bonus.toLocaleString()}</span>
             </div>
           </div>
         ))}
       </div>
 
+      {/* 四季競賽獎金卡片 */}
+      <Card className="p-6">
+        <div className="flex items-center justify-between mb-4">
+          <SectionHead color="#db2777">四季競賽獎金</SectionHead>
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-bold px-3 py-1.5 rounded-full border-2"
+              style={{
+                background: contest.isNewbie ? "#fdf2f8" : "#eff6ff",
+                borderColor: contest.isNewbie ? "#f9a8d4" : "#93c5fd",
+                color: contest.isNewbie ? "#be185d" : "#1d4ed8",
+              }}>
+              {contest.group}
+            </span>
+            <span className="text-base font-bold text-gray-500">
+              每季達標 +{(CONTEST.bonus/10000).toFixed(0)}萬
+            </span>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 mb-4">
+          {contest.quarters.map(cq => (
+            <div key={cq.label}
+              className={`rounded-2xl border-2 p-4 ${cq.passed
+                ? "border-pink-300 bg-pink-50"
+                : "border-gray-200 bg-gray-50"}`}>
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-lg font-black text-slate-900">{cq.label}</span>
+                <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${cq.passed
+                  ? "bg-green-100 text-green-700 border border-green-300"
+                  : "bg-gray-200 text-gray-500"}`}>
+                  {cq.passed ? "✓ 達標" : "✗"}
+                </span>
+              </div>
+              {/* 三個月壽險明細 */}
+              <div className="space-y-0.5 mb-2">
+                {cq.lifeMos.map((l, i) => (
+                  <div key={i} className="flex justify-between text-xs">
+                    <span className="text-gray-400">月{["①","②","③"][i]}</span>
+                    <span className={`font-mono font-bold ${l >= cq.rules.monthlyMin ? "text-green-600" : "text-gray-400"}`}>
+                      {l > 0 ? fmt(l) : "–"}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              <div className="flex justify-between text-sm border-t border-gray-200 pt-1.5">
+                <span className="text-gray-500">競賽獎</span>
+                <span className={`font-black tabular-nums ${cq.passed ? "text-pink-700" : "text-gray-400"}`}>
+                  {cq.passed ? `$${cq.bonus.toLocaleString()}` : "–"}
+                </span>
+              </div>
+              <div className="text-xs mt-1 text-center font-medium"
+                style={{color: cq.passed ? "#be185d" : "#9ca3af"}}>
+                {cq.reason}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* 競賽條件說明 */}
+        <div className="px-4 py-3 rounded-xl bg-gray-50 border border-gray-200 text-sm text-gray-600">
+          <span className="font-semibold text-slate-700">達標條件（壽險 FYC）：</span>
+          {contest.isNewbie
+            ? `連三月每月≥${(CONTEST.newbie.monthlyMin/10000).toFixed(0)}萬，或季總≥${(CONTEST.newbie.quarterTotal/10000).toFixed(0)}萬`
+            : `連三月每月≥${(CONTEST.regular.monthlyMin/10000).toFixed(0)}萬，或季總≥${(CONTEST.regular.quarterTotal/10000).toFixed(0)}萬`
+          }
+        </div>
+
+        <div className="flex items-center justify-between px-5 py-3 mt-3 rounded-xl border-2 border-pink-300 bg-pink-50">
+          <span className="text-lg font-bold text-pink-800">競賽獎金合計</span>
+          <span className="text-2xl font-black text-pink-700 tabular-nums">
+            ${contestTotal.toLocaleString()}
+          </span>
+        </div>
+      </Card>
+
       {/* Personal section */}
       <Card className="p-6">
         <SectionHead color="#2563eb">個人部分</SectionHead>
         <div className="space-y-3">
           {[
-            {label:"實動津貼",       val:act,  sub:"10K→1,000 / 20K→2,000", color:"#059669",bg:"#f0fdf4",bd:"#bbf7d0"},
-            {label:"季獎金合計",     val:qB,   sub:"四季累計 5%–18%",         color:"#7c3aed",bg:"#f5f3ff",bd:"#c4b5fd"},
-            {label:"個人年終 (×18%)",val:ye,   sub:"以年度實動金為基準",       color:"#0ea5e9",bg:"#f0f9ff",bd:"#7dd3fc"},
-            {label:`FYC年終 (${fycLbl})`,val:fycB,sub:`${(fycR*100).toFixed(1)}% 加成`,color:"#d97706",bg:"#fffbeb",bd:"#fde68a"},
-          ].map(item=>(
+            {label:"實動津貼",          val:act,          sub:"10K→1,000 / 20K→2,000",          color:"#059669",bg:"#f0fdf4",bd:"#bbf7d0"},
+            {label:"季獎金合計（比例）", val:qB,           sub:"四季累計 5%–18%",                 color:"#7c3aed",bg:"#f5f3ff",bd:"#c4b5fd"},
+            {label:"四季競賽獎金",       val:contestTotal, sub:`${contest.group}·每季達標$25,000`,color:"#db2777",bg:"#fdf2f8",bd:"#f9a8d4"},
+            {label:"個人年終 (×18%)",   val:ye,           sub:"以年度實動金為基準",               color:"#0ea5e9",bg:"#f0f9ff",bd:"#7dd3fc"},
+            {label:`FYC年終 (${fycLbl})`,val:fycB,         sub:`${(fycR*100).toFixed(1)}% 加成`, color:"#d97706",bg:"#fffbeb",bd:"#fde68a"},
+          ].map(item => (
             <div key={item.label} className="flex items-center justify-between px-5 py-4 rounded-xl border-2"
-              style={{background:item.bg,borderColor:item.bd}}>
+              style={{background:item.bg, borderColor:item.bd}}>
               <div>
                 <p className="text-lg font-bold" style={{color:item.color}}>{item.label}</p>
                 <p className="text-sm text-gray-500">{item.sub}</p>

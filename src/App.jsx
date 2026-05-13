@@ -246,6 +246,7 @@ const DEFAULT_MEMBERS = [
   { id:"CLM", name:"陳立閔", role:"SP-A", parentId:"GHY" },
   { id:"ZYJ", name:"鄭宇倢", role:"CA",   parentId:"GHY" },
   { id:"ZYX", name:"張永璇", role:"CA",   parentId:"GHY" },
+  { id:"ZZZ", name:"鄭宗哲", role:"CA",   parentId:"GHY" },  // 個人組 CA
   { id:"LWC", name:"李偉誠", role:"SP-A", parentId:"GHY" },
   { id:"ZCX", name:"鍾承修", role:"CA",   parentId:"LWC" },
   { id:"LGY", name:"林冠佑", role:"CA",   parentId:"ZCX" },
